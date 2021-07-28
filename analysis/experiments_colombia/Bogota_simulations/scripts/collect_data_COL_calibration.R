@@ -1,0 +1,247 @@
+#!/usr/bin/env Rscript
+##=========================================#
+## Author: Guido Espana
+## Collect data from param sweep
+## Year: 2019
+## 
+## requires:
+##          densimtools library
+##=========================================#
+## User's input----------------
+##=========================================#
+library(tidyverse)
+library(fredtools)
+
+##========================================#
+## Functions -------------
+##========================================#
+get_loglikelihood_poisson <- function(data_in, model_in){
+    model_in[which(model_in == 0)] = 0.00000001
+    ll_out = -sum(dpois(data_in, model_in, log = T), na.rm = T)
+    return(ll_out)
+}
+
+get_loglikelihood <- function(data_in, model_in, reps_in = 1){
+    shape.prior = 1e-3
+    scale.prior = 1e3
+    shape.post = shape.prior + model_in
+    scale.post = scale.prior / (reps_in * scale.prior + 1)
+    prob = 1 / (1 + scale.post)
+    size = shape.post
+    return(-sum(dnbinom(data_in,size=size,prob=prob,log=T), na.rm = T))
+}
+
+get_death_age_likelihood <- function(data_in, model_in){    
+    return(-dmultinom(x=data_in, prob = model_in/sum(model_in), log = T))
+}
+
+##========================================#
+## Fix files -------------
+##========================================#
+check_finished_jobs <- function(params_in){
+    job_id = params_in$job_id[1] ## This should be only the job parameters
+    numDays = params_in$days[1]
+    fred_dir = system(sprintf("fred_find -k %s", job_id), intern = TRUE)
+    data_dir = file.path(fred_dir,
+                         "DATA", "OUT")
+    if(!is.null(attr(fred_dir, "status"))){
+        return(FALSE)
+    }
+
+    fred_status = system(sprintf("fred_status -k %s", job_id), intern = TRUE)
+    if(unlist(strsplit(fred_status, "\\s+"))[1] != "FINISHED"){
+        print(sprintf("STATUS is %s\n", unlist(strsplit(fred_status, "\\s+"))[1]))
+        return(FALSE)
+    }    
+
+    tmp_out = sprintf('tmp_%s.csv', job_id)
+    fred_csv = sprintf("fred_csv -k %s > %s", job_id, tmp_out)    
+    fred_csv_st = system(fred_csv, intern = T)
+    
+    if(!is.null(attr(fred_csv_st, "status"))){
+        unlink(tmp_out)
+        return(FALSE)
+    }
+    job_df = read.csv(tmp_out, stringsAsFactors = FALSE)
+    unlink(tmp_out)
+
+    if(!(file.exists(file.path(data_dir,'AgeGroupsData_mean.csv')) & nrow(job_df) == numDays)){
+        return(FALSE)
+    }
+    return(TRUE)
+}
+
+process_job_data <- function(job_id, process_age = FALSE, age_data = data.frame()){
+    fred_dir = system(sprintf("fred_find -k %s", job_id), intern = TRUE)
+    data_dir = file.path(fred_dir, "DATA", "OUT")   
+    
+    fred_csv = sprintf("fred_csv -k %s", job_id)
+    ##system(fred_csv, intern = T)
+
+    fred_csv_st = system(fred_csv, intern = T)
+    if(!is.null(attr(fred_csv_st, "status"))){
+        ##system(sprintf("rm -rf %s", tmp_out), intern = T)
+        return(FALSE)
+    }
+    
+    job_df = read.csv(text = fred_csv_st, stringsAsFactors = FALSE)
+
+    print(sprintf("Processing job %s", job_id))
+    
+    ##========================================#
+    ## Age stuff-------------
+    ##========================================#
+    age_df = read.csv(file.path(data_dir,'AgeGroupsData_mean.csv'), stringsAsFactors = F)    
+    cols_age = colnames(age_df %>% dplyr::select(-Day))
+
+    job_df = dplyr::left_join(job_df, age_df, by = "Day")
+    
+    ##========================================#
+    ## Read data and compute LL --------------
+    ##========================================#
+    job_df$LL = Inf
+    job_df$Date = as.Date('2020-01-01') + job_df$Day
+
+    ## Group by date and get the overall deaths
+    ## Near future -> collect by localidad
+    tmp_data = filter(BOG_data, MunCode == state_input) %>%
+        group_by(Date) %>% summarize(Cases = sum(Cases), Deaths = sum(Deaths)) %>% ungroup() %>%
+        left_join(job_df, by = c("Date" = "Date"))
+
+    if(nrow(job_df) > 0){
+        tmp_LL = get_loglikelihood(tmp_data$Deaths, tmp_data$CF_mean)
+        tmp_LL_df = data.frame(LL = tmp_LL, stringsAsFactors = FALSE)
+        if(!is.na(tmp_LL)){
+            job_df$LL = tmp_LL
+        }
+
+        if(nrow(age_data) > 0){
+            ## This has to be changed to adjust Bogota data
+            
+            age_data$TotalDeaths  = sum(age_data$Deaths)
+            age_data$NDeaths = age_data$Deaths
+            age_data$PDeaths = age_data$NDeaths / age_data$TotalDeaths
+            
+            ## AGE STRUCTURE DEATHS
+            tmp_fred_CF =  job_df %>% filter(Date <= age_data$Date[1])%>%
+                summarize_at(vars(starts_with('ACF')), 'sum', rm.na = T) %>%
+                gather(key = AgeGroup, value = CF_mean) %>%
+                left_join(age_data, by = "AgeGroup")
+            
+            LL_CF_age = get_death_age_likelihood(tmp_fred_CF$NDeaths, tmp_fred_CF$CF_mean)
+            
+            total_LL = tmp_LL + LL_CF_age
+            job_df$LL = total_LL
+            tmp_LL_df$LL_deaths = tmp_LL
+            tmp_LL_df$LL = total_LL
+            tmp_LL_df$LL_CF_age = LL_CF_age
+        }        
+        
+    }
+    print(sprintf("LL: %.2f", job_df$LL[1]))
+    if(is.infinite(job_df$LL[1])){browser()}
+
+    cols_output = c('Day', 'Week', 'Year', 'Runs', 'N_mean', 'N_std',
+                    'C_mean', 'C_std', 'Cs_mean', 'Cs_std','CFR_mean', 'Is_mean', 'I_mean',
+                    'CFR_std', 'CF_mean', 'CF_std',
+                    'RR_mean', 'RR_std', 'AR_mean', 'AR_std', 'Nursing_Home_mean', 
+                    'Nursing_Home_CF_mean',
+                    'H_sheltering_mean', 'N_sheltering_mean','LL')
+
+
+    cols_output = c(cols_output, cols_age)        
+    return(list(job_df = job_df[,cols_output],
+                extra_params_df = tmp_LL_df))
+}
+
+##========================================#
+## Inputs --------------------
+##========================================#
+state_input = 11001
+data_days_rm = 2
+args = (commandArgs(TRUE))
+
+process_age_flag = TRUE
+asymp_infectivity_in = 1.0
+face_mask_transmission_efficacy_in = 0.73
+kids_susceptibility_age_in = 10
+
+if(length(args) >= 1){
+    state_input = as.numeric(args[1])
+    if(length(args) >=2){
+        data_days_rm = as.numeric(args[2])
+        if(length(args) >= 3){
+            asymp_infectivity_in = as.numeric(args[3])
+            if(length(args) >= 4){
+                face_mask_transmission_efficacy_in = as.numeric(args[4])
+                if(length(args) >= 5){
+                    kids_susceptibility_age_in = as.numeric(args[5])
+                }    
+            }
+        }
+    }
+}
+
+##========================================#
+## Collect for covid --------------------
+##========================================#
+## Incidence data 
+incidence_file = 'COL_covid_death_data.csv'
+age_incidence_file = 'Age_COL_covid_data.csv'
+
+if(!file.exists(file.path('../input_files',incidence_file))){
+    stop("Incidence data not found")
+}
+
+file.copy(file.path('../input_files',incidence_file),file.path('./input_files', incidence_file),  overwrite = T)
+file.copy(file.path('../input_files', age_incidence_file), file.path('./input_files', age_incidence_file), overwrite = T)
+interventions_df = read_csv('./input_files/interventions_Colombia.csv')
+
+BOG_data = read_csv(file.path('./input_files', incidence_file)) %>%
+    mutate(MunCode = as.numeric(MunCode)) %>%
+    filter(MunCode %in% interventions_df$State) %>%
+    filter(Date < (max(Date, na.rm = T) - data_days_rm)) %>%
+    left_join(interventions_df, by = c("MunCode" = "State")) 
+
+BOG_age_data =  read_csv(file.path('./input_files', age_incidence_file)) %>%
+    mutate(MunCode = as.numeric(MunCode)) %>%
+    filter(MunCode %in% interventions_df$State) %>%
+    filter(Date < (max(Date, na.rm = T) - data_days_rm)) %>%
+    mutate(MaxDate = max(Date, na.rm = T)) %>%
+    left_join(interventions_df, by = c("MunCode" = "State")) %>%
+    group_by(AgeGroup) %>%
+    summarize(Deaths = sum(Deaths), Date = MaxDate[1]) %>%
+    ungroup()
+
+
+## TODO:
+## [ ] USE INS data instead of Bogotá data -> More data
+
+simdir_name = sprintf('FRED_%d_calibration_asymp_%.2f_fm_%.2f_ksus_%.2f_mov',state_input, asymp_infectivity_in,face_mask_transmission_efficacy_in,kids_susceptibility_age_in)
+simdir = file.path(Sys.getenv('scratch_dir'), simdir_name)
+
+if(!dir.exists(file.path(getwd(), 'output','CALIBRATION'))){
+    dir.create(file.path(getwd(), 'output','CALIBRATION'), recursive = T)
+}
+
+fred_results_dir = file.path(simdir,"FRED_RESULTS")
+Sys.setenv(FRED_RESULTS=fred_results_dir)
+
+output_dir = file.path(getwd(), 'output','CALIBRATION',sprintf("%s_%s", simdir_name, "out"))
+fred_outputs = 'fred_output.csv'
+params_file = sprintf("%s/%s",simdir, "FRED_parameters.csv")
+
+fredtools::fred_gather_data(params=params_file, outdir=output_dir, outfile=fred_outputs,
+                            FUN=check_finished_jobs, FUN2=process_job_data, rm_out = TRUE,
+                            appendToFile = FALSE,
+                            process_age = process_age_flag,
+                            age_data = BOG_age_data)
+
+
+## Save a copy of the file used for calibration: don't save today's or yesterday's data
+epi_data_out = read_csv(file.path('./input_files', incidence_file)) %>%
+    filter(MunCode %in% interventions_df$State) %>%
+    filter(Date < (max(Date, na.rm = T) - data_days_rm))
+
+write_csv(epi_data_out, file.path(output_dir,incidence_file))
+write_csv(BOG_age_data, file.path(output_dir,age_incidence_file))

@@ -1,0 +1,187 @@
+#!/usr/bin/env Rscript
+##=======================================#
+## Author: Guido Espana
+## Post-processes the output of FRED jobs
+##=======================================#
+## Setup---------------
+##=======================================#
+##quit(save = "no")
+library(tidyverse)
+library(fredtools)
+library(lubridate)
+fred_results_dir = file.path(getwd(), "FRED_RESULTS")
+Sys.setenv(FRED_RESULTS=fred_results_dir)
+
+fred_key = "FRED_11001_school_visualization_asymp_6"
+fred_n = 1
+args = (commandArgs(TRUE))
+if(length(args) >= 1){
+    fred_key = args[1]
+    if(length(args) >= 2){
+        fred_n = as.numeric(args[2])
+    }
+}
+
+cols_output = c('Date','WkDay','Day','N','Year','Week','C','Cs','CFR','Is',
+                'I', 'CF', 'Nursing_Home', 'Nursing_Home_CF', 'E', 'PrevInf',
+                'RR', 'AR', 'Wrk', 'Sch', 'H', 'Nbr', 'H_sheltering', 'N_sheltering')
+
+##========================================#
+## Functions----------------
+##========================================#
+get_infections_CF_df <- function(fred_key, fred_n){
+    ## calculate infectious period
+    data_dir = file.path(system(sprintf("fred_find -k %s", fred_key), intern = TRUE),
+                         "DATA", "OUT")        
+    
+    cols_req = c('day', 'host', 'age', 'exp', 'inf', 'symp','dead')
+
+    
+    conn_inf = file(file.path(data_dir, sprintf("infectionsCF%d.txt",fred_n)), "r")
+    inf_lines = readLines(conn_inf)
+    close(conn_inf)
+
+    if(length(inf_lines) == 0){
+        return(tibble())
+    }
+    inf_list_tmp = str_split(inf_lines[1], pattern="\\s+")[[1]]
+    names_ind = which(inf_list_tmp %in% cols_req) + 1
+
+    infections_cf = data.frame(stringsAsFactors=F)
+    infections_cf = sapply(1:length(inf_lines), function(x){
+        inf_list = str_split(inf_lines[x], pattern="\\s+")[[1]]
+        tmp_df = inf_list[c(names_ind)]
+        return(tmp_df)
+    })
+    infections_cf = t(infections_cf)
+    names(infections_cf) = c(cols_req)
+    infections_cf = as.data.frame(infections_cf, stringsAsFactors = F)
+    colnames(infections_cf) = c(cols_req)    
+    
+    infections_df = infections_cf[,cols_req]
+    infections_df$day = as.numeric(infections_df$day)
+    infections_df$age = floor(as.numeric(infections_df$age))
+    infections_df$exp = as.numeric(infections_df$exp)
+    infections_df$inf = as.numeric(infections_df$inf)
+    infections_df$symp = as.numeric(infections_df$symp)
+    infections_df$dead = as.numeric(infections_df$dead)
+    
+    return(infections_df)
+}
+
+get_infections_df <- function(fred_key, fred_n){
+    data_dir = file.path(system(sprintf("fred_find -k %s", fred_key), intern = TRUE),
+                         "DATA", "OUT")        
+    params_file = file.path(system(sprintf("fred_find -k %s", fred_key), intern = TRUE),
+                            "META", "PARAMS")
+    print("reading file")
+    conn_inf = file(file.path(data_dir, sprintf("infections%d.txt",fred_n)), "r")
+    inf_lines = readLines(conn_inf)
+    close(conn_inf)
+
+    if(length(inf_lines) == 0){
+        return(list(periods = tibble(), intervals = tibble()))
+    }
+    ##cols_req = c('day', 'host','age','infector','at', 'is_teacher', 'is_student','host_census_tract')
+    
+    cols_req = c('day', 'host','age','infector','at', 'mixing_group_lbl',
+                 'size', 'is_teacher', 'is_student', 'sch_census_tract', 'income', 'classroom_lbl', 'host_census_tract', 'home_host_id',
+                 'home_inf_id')
+    cols_vec = c('inf','symp')
+    names_periods = c('inf1', 'inf2','symp1','symp2')
+    
+    infections = data.frame(stringsAsFactors=F)
+    print("parsing file")
+    ##inf_list_tmp = str_split(inf_lines[1], pattern="\\s+")[[1]]
+    ##names_ind = which(inf_list_tmp %in% cols_req) + 1
+    ##names_vec = rep(which(inf_list_tmp %in% cols_vec),each=2) + rep(c(1,2),2)
+
+    total_lines = length(inf_lines)
+    infections = sapply(1:total_lines, function(x){
+        if(!str_detect(inf_lines[x], "at X")){
+            inf_list = str_split(inf_lines[x], pattern="\\s+")[[1]]
+            names_ind = which(inf_list %in% cols_req) + 1
+            names_vec = rep(which(inf_list %in% cols_vec),each=2) + rep(c(1,2),2)
+            tmp_df = inf_list[c(names_ind,names_vec)]
+            return(tmp_df)
+        }
+    })
+    infections = do.call(rbind, infections)
+    infections = as.data.frame(infections, stringsAsFactors = F)
+    colnames(infections) = c(cols_req, names_periods)
+            
+    infections_df = infections[,c(cols_req,names_periods)]
+    infections_df$day = as.numeric(infections_df$day)
+    infections_df$is_teacher = as.numeric(infections_df$is_teacher)
+    infections_df$is_student = as.numeric(infections_df$is_student)
+    infections_df$size = as.numeric(infections_df$size)
+    infections_df$symp1 = as.numeric(infections_df$symp1)
+    infections_df$symp2 = as.numeric(infections_df$symp2)
+    infections_df$income = as.numeric(infections_df$income)
+    infections_df$age = as.numeric(infections_df$age)
+    
+    return(infections_df)
+}
+
+post_process_schools <- function(fred_key, fred_n, min_day_in = 377, geo_file=""){
+    min_day = min_day_in
+    infections_df = get_infections_df(fred_key, fred_n)
+    infections_df = infections_df %>%
+        mutate(children = ifelse(age < 18, 1, 0)) %>%
+        dplyr::select(day, host, infector, at,symp1, symp2, is_teacher,is_student,home_host_id, home_inf_id,host_census_tract, mixing_group_lbl,classroom_lbl, size, sch_census_tract, income, children, age) %>%
+        dplyr::filter(day >= min_day) %>%
+        filter(!is.na(host_census_tract))
+    
+    ##%>% filter(substr(host_census_tract,1,5) == "18141")
+    
+    fatalities_df = get_infections_CF_df(fred_key, fred_n)
+    
+    upz_tract = read_csv(geo_file) %>%
+        mutate(census_tract = sprintf("11001%s", SCACODIGO)) %>%
+        dplyr::select(upz, census_tract)
+
+    infections_df_out = left_join(infections_df, fatalities_df[,c('host','dead')], by = "host") %>%
+        replace_na(list(dead = -1)) %>%
+        left_join(rename(upz_tract, host_upz = upz), by = c("host_census_tract" = "census_tract")) %>%
+        left_join(rename(upz_tract, sch_upz = upz), by = c("sch_census_tract" = "census_tract")) %>%
+        replace_na(list(sch_upz = "-1", host_upz = "-1")) %>%
+        dplyr::select(day, home_host_id, home_inf_id, at,host,infector, mixing_group_lbl, classroom_lbl, size, income, host_census_tract, sch_census_tract,host_upz, sch_upz, is_teacher, is_student,symp1,symp2, dead, age, children) %>%
+        mutate(replicate = fred_n)
+    
+    
+    return(infections_df_out)
+}
+
+
+##=======================================#
+## calculate age outcomes---------------
+##=======================================#
+geo_conv_file = "UPZ_Unidad_Catastral.csv"
+## Process school output
+school_inf_df = tibble()
+for(nn in 1:fred_n){
+    school_inf_df = bind_rows(school_inf_df, post_process_schools(fred_key, nn, min_day_in = 0, geo_file = geo_conv_file))
+}
+data_dir = file.path(system(sprintf("fred_find -k %s", fred_key), intern = TRUE),"DATA")
+out_vis_file = file.path(data_dir, "OUT", "visualization_output.csv")
+write_csv(school_inf_df, path = out_vis_file)
+
+
+## Temporary. Remove.
+##fred_csv = sprintf("fred_csv -k %s", fred_key)
+##fred_csv_st = system(fred_csv, intern = T)
+##job_df = read.csv(text = fred_csv_st, stringsAsFactors = FALSE)
+
+
+## for(nn in 1:fred_n){
+##     fatalities_file = file.path(system(sprintf("fred_find -k %s", fred_key), intern = TRUE),
+##                                 "DATA", "OUT", sprintf("infectionsCF%d.txt",nn))
+##     infections_file = file.path(system(sprintf("fred_find -k %s", fred_key), intern = TRUE),
+##                                 "DATA", "OUT", sprintf("infections%d.txt",nn))
+##     unlink(infections_file)
+##     unlink(fatalities_file)    
+## }
+
+
+
+

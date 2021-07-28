@@ -1,0 +1,41 @@
+library(dplyr)
+library(tidyverse)
+library(mgcv)
+library(MASS)
+
+
+##===============================#
+## Inputs-------------
+##===============================#
+forecast_date = "2020-12-31"
+reps_in = 500
+args = (commandArgs(TRUE))
+
+if(length(args) >= 1){
+    forecast_date = args[1]
+    if(length(args) >= 2){
+        reps_in = as.numeric(reps_in)
+    }
+}
+forecast_date = as.Date(forecast_date)
+
+##===============================#
+## Read data-------------
+##===============================#
+if(!file.exists('./input_files/USA_google_movement_data.csv')){
+    stop("Incidence data not found")
+}
+
+google_data = read_csv('./input_files/USA_google_movement_data.csv') %>%
+    dplyr::filter(sub_region_1 %in% interventions_df$state_name) %>%
+    mutate(day = as.numeric(date - min(date))) %>%
+    dplyr::select(ends_with('baseline'), date, sub_region_1) %>%
+    tidyr::gather(key = category, value = trend_mobility, -c('sub_region_1', 'date'))
+
+categories_google = unique(google_data$category)
+layout(matrix(1:length(categories_google), nrow = floor(length(categories_google)/2)))
+for(ct in 1:length(categories_google)){
+   tmp_data_base = dplyr::filter(google_data, sub_region_1 == 'Bogota', category == categories_google[ct])
+   plot(tmp_data_base$date, tmp_data_base$trend_mobility, type = "l", ylab = categories_google[ct])
+   abline(h = 1)
+}
